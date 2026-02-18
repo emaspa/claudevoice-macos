@@ -1,0 +1,15 @@
+{
+    "enabled": true,
+    "voice": "en-US-AndrewNeural",
+    "rate": "+0%",
+    "volume": "+0%",
+    "pitch": "+0Hz",
+    "debug": false,
+    "messages": {
+        "prompt_submit": "On it.",
+        "stop": "Done. {summary}",
+        "notification_permission_prompt": "Need your permission. {message}",
+        "notification_idle_prompt": "Waiting for your input.",
+        "notification_default": "{message}"
+    }
+}
