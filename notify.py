@@ -1,14 +1,14 @@
 """Claude Code voice notification hook (macOS).
 
-Speaks aloud when Claude finishes a task or needs user input.
+Speaks aloud when Claude starts, finishes, or needs user input.
+Supports personality-driven message templates and direct CLI invocation.
 Uses edge-tts (Microsoft neural voices) for TTS and afplay for playback.
 """
-
-from __future__ import annotations
 
 import asyncio
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -16,7 +16,6 @@ import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-MAX_MESSAGE_LENGTH = 250
 
 # --- Audio playback (macOS) ---
 
@@ -59,18 +58,78 @@ def load_config() -> dict:
         return DEFAULT_CONFIG
 
 
+# --- Personality ---
+
+# Maps personality.md section headers to config.json message keys
+_SECTION_MAP = {
+    "acknowledgments": "prompt_submit",
+    "completions": "stop",
+    "permissions": "notification_permission_prompt",
+    "idle": "notification_idle_prompt",
+}
+
+
+def _load_personality() -> dict[str, list[str]]:
+    """Parse personality.md into {message_key: [template, ...]}."""
+    personality_path = SCRIPT_DIR / "personality.md"
+    try:
+        text = personality_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+
+    sections: dict[str, list[str]] = {}
+    current_key = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("## "):
+            header = line[3:].strip().lower()
+            current_key = _SECTION_MAP.get(header)
+        elif current_key and line.startswith("- "):
+            template = line[2:].strip()
+            if template:
+                sections.setdefault(current_key, []).append(template)
+    return sections
+
+
+def _pick_template(personality: dict[str, list[str]], key: str) -> str | None:
+    """Pick a random template from the personality for the given key."""
+    templates = personality.get(key)
+    if templates:
+        return random.choice(templates)
+    return None
+
+
 # --- Message resolution ---
 
 
-def _truncate(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> str:
-    if len(text) <= max_len:
-        return text
-    # Cut at last sentence boundary within limit, or just truncate
-    cut = text[:max_len]
-    last_period = cut.rfind(".")
-    if last_period > max_len // 2:
-        return cut[: last_period + 1]
-    return cut.rstrip() + "."
+def _split_sentences(text: str) -> list[str]:
+    """Split text into complete sentences."""
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [s.strip() for s in parts if s.strip()]
+
+
+def _take_sentences(text: str, max_sentences: int = 3) -> str:
+    """Keep up to max_sentences complete sentences from text.
+
+    Avoids cutting mid-thought. If the text has no sentence boundaries,
+    returns it as-is (better to say a full thought than chop it).
+    """
+    sentences = _split_sentences(text)
+    if not sentences:
+        return text.strip()
+    kept = sentences[:max_sentences]
+    return " ".join(kept)
+
+
+def _strip_paths(text: str) -> str:
+    """Remove file paths that add nothing as speech."""
+    # Unix absolute paths: /foo/bar (but not standalone /)
+    text = re.sub(r"(?<!\w)/[\w.\-/]+", "", text)
+    # Dotted relative paths: ./foo, ../foo
+    text = re.sub(r"\.{1,2}/[\w.\-/]+", "", text)
+    # Clean up orphaned prepositions left after path removal
+    text = re.sub(r"\s+(?:in|at|from|to|of|on)\s*$", "", text, flags=re.IGNORECASE)
+    return text
 
 
 def _clean_line(line: str) -> str:
@@ -85,6 +144,8 @@ def _clean_line(line: str) -> str:
     line = re.sub(r"\*{1,2}", "", line)
     # Remove headers, bullets, blockquotes at start of line
     line = re.sub(r"^[#>\-*\s]+", "", line)
+    # Remove file paths
+    line = _strip_paths(line)
     # Collapse whitespace
     line = re.sub(r"\s+", " ", line).strip()
     return line
@@ -104,12 +165,23 @@ def _get_speakable_lines(text: str) -> list[str]:
 
 
 def _first_sentence(text: str) -> str:
-    """Extract the first sentence from text."""
-    # Match up to the first sentence-ending punctuation
-    m = re.match(r"(.+?[.!?])\s", text + " ")
-    if m and len(m.group(1)) < 150:
-        return m.group(1)
-    return text[:150]
+    """Extract the first complete sentence from text."""
+    sentences = _split_sentences(text)
+    if sentences:
+        return sentences[0]
+    return text.strip()
+
+
+def _clean_prompt(prompt: str) -> str:
+    """Extract the speakable intent from a user prompt.
+
+    Takes the first meaningful sentence — enough to capture what was asked
+    without reading back the entire prompt verbatim.
+    """
+    lines = _get_speakable_lines(prompt)
+    if not lines:
+        return ""
+    return _first_sentence(lines[0])
 
 
 def _extract_summary(transcript_path: str) -> str:
@@ -138,56 +210,88 @@ def _extract_summary(transcript_path: str) -> str:
         if not lines:
             return ""
 
-        first = _first_sentence(lines[0])
-        last = _first_sentence(lines[-1])
-
-        # If first and last are the same (short response), just use one
-        if first == last or len(lines) == 1:
-            return first
-
-        # Combine: what was done + what's needed from the user
-        return f"{first} {last}"
+        # Gather all speakable text, take the most meaningful sentences
+        full_text = " ".join(lines)
+        return _take_sentences(full_text, max_sentences=2)
 
     except (OSError, json.JSONDecodeError, KeyError):
         pass
     return ""
 
 
-def resolve_message(event: dict, config: dict) -> str | None:
+def resolve_message(
+    event: dict, config: dict, personality: dict[str, list[str]]
+) -> str | None:
     hook_event = event.get("hook_event_name", "")
     messages = config.get("messages", DEFAULT_CONFIG["messages"])
 
     if hook_event == "UserPromptSubmit":
-        return messages.get("prompt_submit", "On it.")
+        prompt = _clean_prompt(event.get("prompt", ""))
+        template = _pick_template(personality, "prompt_submit")
+        if template:
+            # If the template uses {prompt} but we have nothing speakable,
+            # pick a template without {prompt} or fall back to config
+            if "{prompt}" in template and not prompt:
+                no_placeholder = [
+                    t for t in personality.get("prompt_submit", [])
+                    if "{prompt}" not in t
+                ]
+                if no_placeholder:
+                    return random.choice(no_placeholder)
+                return messages.get("prompt_submit", "On it.")
+            return _take_sentences(template.replace("{prompt}", prompt))
+        # No personality — use config template
+        fallback = messages.get("prompt_submit", "{prompt}")
+        if "{prompt}" in fallback:
+            if not prompt:
+                return messages.get("prompt_submit_fallback", "On it.")
+            return _take_sentences(fallback.replace("{prompt}", prompt))
+        return fallback
 
     if hook_event == "Stop":
         if event.get("stop_hook_active", False):
             return None
-        template = messages.get("stop", "Done. {summary}")
         summary = event.get("transcript_summary", "")
         if not summary:
             transcript_path = event.get("transcript_path", "")
             if transcript_path:
                 summary = _extract_summary(transcript_path)
+        template = _pick_template(personality, "stop")
+        if template:
+            if not summary:
+                # Strip the {summary} placeholder and any trailing space
+                text = template.replace("{summary}", "").strip()
+            else:
+                text = template.replace("{summary}", summary)
+            return _take_sentences(text)
+        # No personality — use config template
+        template = messages.get("stop", "{summary}")
         if not summary:
             text = template.replace("{summary}", "").strip()
         else:
-            # Avoid stuttering like "Done. Done. ..." when the summary
-            # already starts with the same prefix as the template.
             prefix = template.split("{summary}")[0].strip().rstrip(".").lower()
             if prefix and summary.lower().startswith(prefix):
                 text = summary
             else:
                 text = template.replace("{summary}", summary)
-        return _truncate(text)
+        return _take_sentences(text)
 
     if hook_event == "Notification":
         notif_type = event.get("notification_type", "")
         key = f"notification_{notif_type}"
+        # Try personality first
+        template = _pick_template(personality, key)
+        if not template and notif_type == "idle_prompt":
+            template = _pick_template(personality, "notification_idle_prompt")
+        if template:
+            raw_message = event.get("message", "")
+            text = template.replace("{message}", raw_message)
+            return _take_sentences(text)
+        # Fall back to config
         template = messages.get(key, messages.get("notification_default", "{message}"))
         raw_message = event.get("message", "Notification")
         text = template.replace("{message}", raw_message)
-        return _truncate(text)
+        return _take_sentences(text)
 
     return None
 
@@ -195,22 +299,54 @@ def resolve_message(event: dict, config: dict) -> str | None:
 # --- TTS ---
 
 
-async def _generate_and_play(text: str, config: dict) -> None:
-    import edge_tts
+def _speak_elevenlabs(text: str, config: dict) -> None:
+    from elevenlabs import save
+    from elevenlabs.client import ElevenLabs
+
+    el_config = config.get("elevenlabs", {})
+    api_key = el_config.get("api_key") or os.environ.get("ELEVENLABS_API_KEY", "")
+    client = ElevenLabs(api_key=api_key)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tmp_path = tmp.name
     tmp.close()
 
     try:
-        comm = edge_tts.Communicate(
-            text,
-            voice=config.get("voice", "en-US-GuyNeural"),
-            rate=config.get("rate", "+0%"),
-            volume=config.get("volume", "+0%"),
-            pitch=config.get("pitch", "+0Hz"),
+        audio = client.text_to_speech.convert(
+            text=text,
+            voice_id=el_config.get("voice_id", "JBFqnCBsd6RMkjVDRZzb"),
+            model_id=el_config.get("model_id", "eleven_multilingual_v2"),
+            output_format=el_config.get("output_format", "mp3_44100_128"),
         )
-        await comm.save(tmp_path)
+        save(audio, tmp_path)
+        play_mp3(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+async def _generate_edge_tts(text: str, config: dict, tmp_path: str) -> None:
+    import edge_tts
+
+    comm = edge_tts.Communicate(
+        text,
+        voice=config.get("voice", "en-US-GuyNeural"),
+        rate=config.get("rate", "+0%"),
+        volume=config.get("volume", "+0%"),
+        pitch=config.get("pitch", "+0Hz"),
+    )
+    await comm.save(tmp_path)
+
+
+def _speak_edge_tts(text: str, config: dict) -> None:
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+
+    try:
+        asyncio.run(_generate_edge_tts(text, config, tmp_path))
         play_mp3(tmp_path)
     finally:
         try:
@@ -220,7 +356,11 @@ async def _generate_and_play(text: str, config: dict) -> None:
 
 
 def speak(text: str, config: dict) -> None:
-    asyncio.run(_generate_and_play(text, config))
+    tts_engine = config.get("tts_engine", "edge-tts")
+    if tts_engine == "elevenlabs":
+        _speak_elevenlabs(text, config)
+    else:
+        _speak_edge_tts(text, config)
 
 
 # --- Entry point ---
@@ -236,18 +376,27 @@ def _debug_log(event: dict) -> None:
 
 
 def main() -> None:
-    raw = sys.stdin.read()
-    event = json.loads(raw) if raw.strip() else {}
-
     config = load_config()
-
-    if config.get("debug", False):
-        _debug_log(event)
 
     if not config.get("enabled", True):
         return
 
-    message = resolve_message(event, config)
+    # CLI mode: python3 notify.py --say "message"
+    if len(sys.argv) > 1 and sys.argv[1] == "--say":
+        message = " ".join(sys.argv[2:]).strip()
+        if message:
+            speak(message, config)
+        return
+
+    # Hook mode: read event from stdin
+    raw = sys.stdin.read()
+    event = json.loads(raw) if raw.strip() else {}
+
+    if config.get("debug", False):
+        _debug_log(event)
+
+    personality = _load_personality()
+    message = resolve_message(event, config, personality)
     if message:
         speak(message, config)
 

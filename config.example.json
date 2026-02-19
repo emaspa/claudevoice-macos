@@ -1,0 +1,23 @@
+{
+    "enabled": true,
+    "tts_engine": "edge-tts",
+    "voice": "en-US-AndrewNeural",
+    "rate": "+0%",
+    "volume": "+0%",
+    "pitch": "+0Hz",
+    "elevenlabs": {
+        "api_key": "",
+        "voice_id": "JBFqnCBsd6RMkjVDRZzb",
+        "model_id": "eleven_multilingual_v2",
+        "output_format": "mp3_44100_128"
+    },
+    "debug": false,
+    "messages": {
+        "prompt_submit": "{prompt}",
+        "prompt_submit_fallback": "On it.",
+        "stop": "{summary}",
+        "notification_permission_prompt": "Need your permission. {message}",
+        "notification_idle_prompt": "Waiting for your input.",
+        "notification_default": "{message}"
+    }
+}
